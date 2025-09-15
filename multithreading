@@ -28,6 +28,7 @@ struct Detection {
     float min_x, max_x, min_y, max_y;
 };
 
+std::atomic<int> occ{0};
 
 struct Track1D {
     int id;
@@ -117,6 +118,7 @@ Result run_tracking_1D(const std::vector<Detection>& seq) {
     int next_id = 1;
     int counts_in = 0, counts_out = 0;
 
+
     for (const auto& det : seq) {
         const auto& dets = det.centroids;
         std::set<std::pair<float,float>> assigned;
@@ -150,11 +152,12 @@ Result run_tracking_1D(const std::vector<Detection>& seq) {
                 if (t.streak >= MIN_STREAK) {
                     if (t.last_x > LINE_POS && t.x <= LINE_POS &&
                         (det.frame - t.last_cross) > COOLDOWN) {
-                        counts_out++;
+                        counts_out++; occ--;
                         t.last_cross = det.frame;
                     } else if (t.last_x <= LINE_POS && t.x > LINE_POS &&
                                (det.frame - t.last_cross) > COOLDOWN) {
                         counts_in++;
+                        occ++;
                         t.last_cross = det.frame;
                     }
                 }
@@ -288,102 +291,172 @@ std::vector<int> hungarian(const std::vector<std::vector<float>>& cost) {
 // =========================
 // Tracking 2D (Kalman+Hungarian)
 // =========================
-Result run_tracking_2D(const std::vector<Detection>& seq) {
-    const int   MAX_AGE     = 5;
-    const float DIST_THRESH = 2.0f;
-    const int   COOLDOWN    = 25;
-    const int   MIN_STREAK  = 10;
-    const int   LINE_POS    = 0;
+// =========================
+// Kalman 2D
+// =========================
+struct Kalman2D {
+    float x, y;    // posizione
+    float vx, vy;  // velocità
+    float P[4][4]; // covarianza (semplificata)
 
-    std::map<int, Track2D> tracks;
-    int next_id = 1;
+    Kalman2D(float init_x=0, float init_y=0) {
+        x = init_x; y = init_y;
+        vx = vy = 0;
+        // identità
+        for(int i=0;i<4;i++)
+            for(int j=0;j<4;j++)
+                P[i][j] = (i==j)?1.0f:0.0f;
+    }
+
+    void predict(float dt=1.0f) {
+        x += vx*dt;
+        y += vy*dt;
+        // Aggiungi un po' di rumore
+        P[0][0]+=0.01f; P[1][1]+=0.01f;
+    }
+
+    void update(float zx, float zy) {
+        // innovazione
+        float yx = zx - x;
+        float yy = zy - y;
+
+        // guadagni semplici (R=0.1)
+        float K = 0.5f;
+
+        x += K * yx;
+        y += K * yy;
+        vx += K * yx;
+        vy += K * yy;
+    }
+};
+
+// =========================
+// Distanza euclidea
+// =========================
+float dist2(const std::pair<float,float>& a, const std::pair<float,float>& b) {
+    float dx=a.first-b.first, dy=a.second-b.second;
+    return std::sqrt(dx*dx+dy*dy);
+}
+
+// =========================
+// Hungarian 2x2 semplificato
+// =========================
+std::vector<int> hungarian2x2(const std::vector<std::vector<float>>& cost) {
+    // cost[i][j] → costo track i con detection j
+    float sum1 = cost[0][0] + cost[1][1];
+    float sum2 = cost[0][1] + cost[1][0];
+    if (sum1 <= sum2) return {0,1}; // assegna t0->d0, t1->d1
+    else return {1,0};              // assegna t0->d1, t1->d0
+}
+
+// =========================
+// Tracking 2 persone con Kalman+Hungarian
+// =========================
+// =========================
+// Tracking 2 persone robusto
+// =========================
+Result run_tracking_2people(const std::vector<Detection>& seq) {
+    const float LINE_POS = 0.0f;
+    const float DEADZONE = 0.15f;
+    const int COOLDOWN = 15;
+
+    if (seq.empty()) return {0,0};
+
+    int n2_frames = 0;
+    for (auto &d : seq) if (d.n == 2) n2_frames++;
+
     int counts_in = 0, counts_out = 0;
 
-    for (const auto& det : seq) {
-        auto dets = det.centroids;
+    // -------------------------------
+    // Caso A: tanti frame con n=2 → Kalman+Hungarian
+    // -------------------------------
+    if (n2_frames >= (int)(seq.size() * 0.4)) {
+        std::map<int,Kalman2D> tracks;
+        std::map<int,int> last_cross;
+        int next_id=1;
 
-        // Predict
-        std::map<int, std::pair<float,float>> predicted;
-        for (auto& kv : tracks) {
-            auto& t = kv.second;
-            t.x += t.vx;
-            t.y += t.vy;
-            predicted[t.id] = {t.x, t.y};
-        }
+        for (const auto& det : seq) {
+            if (det.centroids.size() < 2) continue;
 
-        // Cost matrix
-        std::vector<int> tids;
-        for (auto& kv : tracks) tids.push_back(kv.first);
-        std::vector<std::vector<float>> cost(tids.size(), std::vector<float>(dets.size(), 1e6));
-
-        for (int i=0;i<tids.size();i++) {
-            for (int j=0;j<dets.size();j++) {
-                cost[i][j] = dist2D(predicted[tids[i]], dets[j]);
+            // Inizializza tracks
+            if (tracks.empty()) {
+                for (auto& c : det.centroids) {
+                    tracks[next_id] = Kalman2D(c.first, c.second);
+                    last_cross[next_id] = -COOLDOWN;
+                    next_id++;
+                }
+                continue;
             }
-        }
 
-        // Hungarian assignment
-        std::vector<int> assign;
-        if (!cost.empty() && !dets.empty()) {
-            assign = hungarian(cost);
-        }
+            // Predict
+            for (auto &kv : tracks) kv.second.predict();
 
-        std::set<int> assigned_dets;
+            // Cost matrix 2x2
+            std::vector<int> tids;
+            for (auto &kv : tracks) tids.push_back(kv.first);
 
-        // Update tracks
-        for (int i=0;i<tids.size();i++) {
-            int tid = tids[i];
-            auto& t = tracks[tid];
-            int j = (assign.empty() ? -1 : assign[i]);
-            if (j>=0 && j<dets.size() && cost[i][j] < DIST_THRESH) {
-                auto d = dets[j];
-                t.vx = d.first - t.x;
-                t.vy = d.second - t.y;
-                t.x = d.first;
-                t.y = d.second;
-                t.missed = 0;
-                t.age++;
-
-                if (t.age >= MIN_STREAK) {
-                    if (t.last_x <= LINE_POS && t.x > LINE_POS &&
-                        (det.frame - t.last_cross) > COOLDOWN) {
-                        counts_in++;
-                        t.last_cross = det.frame;
-                    } else if (t.last_x > LINE_POS && t.x <= LINE_POS &&
-                        (det.frame - t.last_cross) > COOLDOWN) {
-                        counts_out++;
-                        t.last_cross = det.frame;
+            if (tids.size()==2 && det.centroids.size()==2) {
+                std::vector<std::vector<float>> cost(2,std::vector<float>(2,0));
+                for (int i=0;i<2;i++) {
+                    auto &t=tracks[tids[i]];
+                    for (int j=0;j<2;j++) {
+                        cost[i][j]=dist2({t.x,t.y}, det.centroids[j]);
                     }
                 }
-                t.last_x = t.x;
-                assigned_dets.insert(j);
-            } else {
-                t.missed++;
-            }
-        }
+                auto assign = hungarian2x2(cost);
 
-        // Cancella track persi
-        for (auto it = tracks.begin(); it!=tracks.end();) {
-            if (it->second.missed > MAX_AGE) {
-                it = tracks.erase(it);
-            } else {
-                ++it;
-            }
-        }
+                for (int i=0;i<2;i++) {
+                    auto &t=tracks[tids[i]];
+                    auto d=det.centroids[assign[i]];
+                    t.update(d.first,d.second);
 
-        // Nuovi track
-        for (int j=0;j<dets.size();j++) {
-            if (!assigned_dets.count(j)) {
-                auto d = dets[j];
-                Track2D t{next_id, d.first, d.second, 0,0,0,0,d.first,-COOLDOWN};
-                tracks[next_id] = t;
-                next_id++;
+                    // Check cross
+                    if (t.x > LINE_POS+DEADZONE && t.vx<0 &&
+                        det.frame-last_cross[tids[i]]>COOLDOWN) {
+                        counts_in++; occ++;
+                        last_cross[tids[i]]=det.frame;
+                    }
+                    else if (t.x < LINE_POS-DEADZONE && t.vx>0 &&
+                        det.frame-last_cross[tids[i]]>COOLDOWN) {
+                        counts_out++; occ--;
+                        last_cross[tids[i]]=det.frame;
+                    }
+                }
             }
         }
     }
+    // -------------------------------
+    // Caso B: pochi frame con n=2 → fallback con start-end
+    // -------------------------------
+    else {
+        // Usa la traiettoria aggregata di tutti i centroidi
+        std::vector<float> xs;
+        xs.reserve(seq.size());
+        for (const auto& d : seq) {
+            for (auto& c : d.centroids) xs.push_back(c.first);
+        }
+        if (xs.size() < 5) return {0,0};
 
-    return {counts_in, counts_out};
+        int k = std::max(1,(int)(xs.size()*0.2));
+        float avg_start = std::accumulate(xs.begin(), xs.begin()+k, 0.0f)/k;
+        float avg_end   = std::accumulate(xs.end()-k, xs.end(), 0.0f)/k;
+
+        if (avg_start > LINE_POS+DEADZONE && avg_end < LINE_POS-DEADZONE) {
+            counts_in+=2; occ+=2; // 2 persone entrate
+            std::cout << "[N2 Fallback] pos->neg → IN (2 persone)\n";
+        }
+        else if (avg_start < LINE_POS-DEADZONE && avg_end > LINE_POS+DEADZONE) {
+            counts_out+=2; occ-=2; // 2 persone uscite
+            std::cout << "[N2 Fallback] neg->pos → OUT (2 persone)\n";
+        }
+        else {
+            std::cout << "[N2 Fallback] nessun cross chiaro\n";
+        }
+    }
+
+    return {counts_in,counts_out};
 }
+
 // =========================
 // Open3D → Point Cloud
 // =========================
@@ -667,9 +740,10 @@ struct Kalman1D {
 // Tracking con Kalman
 // ----------------------------
 Result run_tracking_bbox_1D(const std::vector<Detection>& seq) {
-    const float LINE_POS = 0.0f;  // linea virtuale
-    const float DEADZONE = 0.15f; // margine attorno allo zero
-    const int   KAVG     = 10;    // quanti frame mediati all’inizio/fine
+    const float LINE_POS   = 0.0f;   // linea virtuale
+    const float DEADZONE   = 0.15f;  // margine attorno allo zero
+    const int   KAVG       = 10;     // quanti frame mediati all’inizio/fine
+    const float MIN_SHIFT  = 0.30f;  // spostamento minimo richiesto (metri)
 
     int counts_in = 0, counts_out = 0;
     if (seq.empty()) return {0,0};
@@ -677,56 +751,45 @@ Result run_tracking_bbox_1D(const std::vector<Detection>& seq) {
     Kalman1D kf;
     std::vector<float> traj;
 
-    // --- Filtra tutti i frame ---
+    // --- Filtra tutti i frame con Kalman ---
     for (const auto& det : seq) {
         if (det.centroids.empty()) continue;
 
         float cx = det.centroids[0].first;
-
         kf.predict();
         kf.update(cx);
-
         traj.push_back(kf.x);
     }
 
     if (traj.size() < 5) return {0,0}; // troppo pochi dati
 
     // --- Media primi e ultimi KAVG ---
-    // --- Start robusto con majority voting sui centroidi grezzi ---
-    int k_start = std::min(5, (int)seq.size()); // primi 5 frame del blocco
-    int pos_count = 0, neg_count = 0;
-    for (int i = 0; i < k_start; i++) {
-        if (!seq[i].centroids.empty()) {
-            float x0 = seq[i].centroids[0].first;
-            if (x0 > LINE_POS) pos_count++;
-            else neg_count++;
-        }
-    }
-    float avg_start = (pos_count > neg_count) ? (LINE_POS + DEADZONE + 0.1f)
-                                              : (LINE_POS - DEADZONE - 0.1f);
+    int k = std::min(KAVG, (int)traj.size()/2);
+    float avg_start = std::accumulate(traj.begin(), traj.begin()+k, 0.0f) / k;
+    float avg_end   = std::accumulate(traj.end()-k, traj.end(), 0.0f) / k;
 
-    // --- End resta mediato dal Kalman ---
-    int k_end = std::min(KAVG, (int)traj.size()/2);
-    float avg_end = std::accumulate(traj.end()-k_end, traj.end(), 0.0f) / k_end;
+    float shift = avg_end - avg_start;
 
     // --- Decidi direzione ---
-    if (avg_start < LINE_POS - DEADZONE && avg_end > LINE_POS + DEADZONE) {
-        counts_out++;
-        std::cout << "[KALMAN CROSS] neg->pos → out"
-                  << " (start="<<avg_start<<", end="<<avg_end<<")\n";
+    if (avg_start < LINE_POS - DEADZONE && avg_end > LINE_POS + DEADZONE && shift > MIN_SHIFT) {
+        counts_out++; occ--;
+        std::cout << "[KALMAN CROSS] neg->pos → OUT"
+                  << " (start="<<avg_start<<", end="<<avg_end<<", shift="<<shift<<")\n";
     }
-    else if (avg_start > LINE_POS + DEADZONE && avg_end < LINE_POS - DEADZONE) {
-        counts_in++;
-        std::cout << "[KALMAN CROSS] pos->neg → in"
-                  << " (start="<<avg_start<<", end="<<avg_end<<")\n";
+    else if (avg_start > LINE_POS + DEADZONE && avg_end < LINE_POS - DEADZONE && shift < -MIN_SHIFT) {
+        counts_in++; occ++;
+        std::cout << "[KALMAN CROSS] pos->neg → IN"
+                  << " (start="<<avg_start<<", end="<<avg_end<<", shift="<<shift<<")\n";
     }
     else {
         std::cout << "[KALMAN NO CROSS] start="<<avg_start
-                  << " end="<<avg_end<<"\n";
+                  << " end="<<avg_end
+                  << " shift="<<shift<<"\n";
     }
 
     return {counts_in, counts_out};
 }
+
 
 
 // =========================
@@ -764,7 +827,7 @@ void thread2_func() {
         queue_thread2.pop_front();
         lock.unlock();
 
-        Result r = run_tracking_2D(block);
+        Result r = run_tracking_2people(block);
         std::cout << "[THREAD2] IN=" << r.in_count << " OUT=" << r.out_count << "\n";
         std::cout << block.size() << " frames processed\n"; 
         for (const auto& det : block) {
