@@ -1,0 +1,916 @@
+#include "ArducamTOFCamera.hpp"
+#include <chrono>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <Eigen/Dense>
+#include <open3d/Open3D.h>
+#include <filesystem>
+#include <random>
+#include <numeric>
+#include <cmath>
+
+// ONNX Runtime
+#include <onnxruntime_cxx_api.h>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <vector>
+
+// =========================
+// Strutture e variabili globali
+// =========================
+struct Detection {
+    int frame;
+    int n;
+    std::vector<std::pair<float,float>> centroids; // (x,y)
+    float min_x, max_x, min_y, max_y;
+};
+
+
+struct Track1D {
+    int id;
+    float x;
+    int streak;
+    int missed;
+    float last_x;
+    int last_cross;
+};
+
+struct Track2D {
+    int id;
+    float x, y;
+    float vx, vy;
+    int age;
+    int missed;
+    float last_x;
+    int last_cross;
+};
+
+struct Result {
+    int in_count;
+    int out_count;
+};
+
+
+std::deque<Detection> detections;
+std::deque<std::vector<Detection>> queue_thread1;
+std::deque<std::vector<Detection>> queue_thread2;
+
+std::mutex mtx_det, mtx1, mtx2;
+std::condition_variable cv_det, cv1, cv2;
+
+bool finished = false;
+
+namespace fs = std::filesystem;
+using namespace Arducam;
+
+// =========================
+// Parametri / Costanti
+// =========================
+static constexpr int   MAX_DISTANCE     = 4000; // mm
+static constexpr int   CONFIDENCE_VALUE = 60;   // soglia confidenza
+static constexpr size_t kNumPoints      = 1024; // input rete
+static constexpr float PROB_THRESH      = 0.93f;
+
+// =========================
+// Camera helpers
+// =========================
+bool getControl(ArducamTOFCamera& tof, Control mode, float& val, float alpha = 1.0) {
+    int tmp = 0;
+    if (tof.getControl(mode, &tmp) != 0) return false;
+    val = tmp / alpha;
+    return true;
+}
+Eigen::Vector3f geometricCentroidM(const std::shared_ptr<open3d::geometry::PointCloud>& cloud) {
+    Eigen::Vector3f c(0,0,0);
+    if (cloud->points_.empty()) return c;
+    for (const auto& p : cloud->points_) {
+        c += Eigen::Vector3f((float)p(0),(float)p(1),(float)p(2));
+    }
+    c /= (float)cloud->points_.size(); // media
+    return c;
+}
+bool initCamera(ArducamTOFCamera& tof, const char* cfg_path) {
+    if (cfg_path && tof.openWithFile(cfg_path)) return false;
+    if (!cfg_path && tof.open(Connection::CSI)) return false;
+    if (tof.start(FrameType::DEPTH_FRAME)) return false;
+    tof.setControl(Control::RANGE, MAX_DISTANCE);
+    return true;
+}
+
+ArducamFrameBuffer* acquireFrame(ArducamTOFCamera& tof) {
+    return tof.requestFrame(500);
+}
+// =========================
+// Tracking 1D (semplice)
+// =========================
+Result run_tracking_1D(const std::vector<Detection>& seq) {
+    const float DIST_THRESH = 0.5f;
+    const int MIN_STREAK    = 15;
+    const int MAX_MISSED    = 5;
+    const int COOLDOWN      = 10;
+    const int LINE_POS      = -0.3f;
+
+    std::map<int, Track1D> tracks;
+    int next_id = 1;
+    int counts_in = 0, counts_out = 0;
+
+    for (const auto& det : seq) {
+        const auto& dets = det.centroids;
+        std::set<std::pair<float,float>> assigned;
+
+        // Aggiorna tracks
+        for (auto it = tracks.begin(); it != tracks.end();) {
+            auto& t = it->second;
+            t.missed++;
+            if (t.missed > MAX_MISSED) {
+                it = tracks.erase(it);
+                continue;
+            }
+
+            float best_d = 1e9;
+            std::pair<float,float> best_det;
+            bool found = false;
+
+            for (auto d : dets) {
+                float dist = std::fabs(d.first - t.x);
+                if (dist < best_d) {
+                    best_d = dist;
+                    best_det = d;
+                    found = true;
+                }
+            }
+            if (found && best_d < DIST_THRESH && !assigned.count(best_det)) {
+                t.x = best_det.first;
+                t.streak++;
+                t.missed = 0;
+
+                if (t.streak >= MIN_STREAK) {
+                    if (t.last_x > LINE_POS && t.x <= LINE_POS &&
+                        (det.frame - t.last_cross) > COOLDOWN) {
+                        counts_out++;
+                        t.last_cross = det.frame;
+                    } else if (t.last_x <= LINE_POS && t.x > LINE_POS &&
+                               (det.frame - t.last_cross) > COOLDOWN) {
+                        counts_in++;
+                        t.last_cross = det.frame;
+                    }
+                }
+                t.last_x = t.x;
+                assigned.insert(best_det);
+            }
+            ++it;
+        }
+
+        // Nuovi track
+        for (auto d : dets) {
+            if (!assigned.count(d)) {
+                Track1D t{next_id, d.first, 1, 0, d.first, -COOLDOWN};
+                tracks[next_id] = t;
+                next_id++;
+            }
+        }
+    }
+
+    return {counts_in, counts_out};
+}
+std::pair<float,float> compute_person_center(
+    const std::shared_ptr<open3d::geometry::PointCloud>& cloud,
+    float reg_x, float reg_y,
+    bool reg_valid, float anchor_thresh = 0.4f)
+{
+    // Calcola centro bbox
+    auto bbox = cloud->GetAxisAlignedBoundingBox();
+    auto cbox = bbox.GetCenter();
+    std::pair<float,float> center_box((float)cbox.x(), (float)cbox.y());
+
+    // Calcola centro geometrico
+    auto cgeom = geometricCentroidM(cloud);
+    std::pair<float,float> center_geom(cgeom.x(), cgeom.y());
+
+    if (reg_valid) {
+        std::pair<float,float> center_net(reg_x, reg_y);
+        float dx = center_box.first - center_net.first;
+        float dy = center_box.second - center_net.second;
+        float dist = std::sqrt(dx*dx + dy*dy);
+
+        if (dist < anchor_thresh) {
+            return center_box; // bbox valido
+        } else {
+            return center_geom; // fallback
+        }
+    } else {
+        return center_box; // se la rete non ha dato nulla
+    }
+}
+
+
+// =========================
+// Tracking 1D basato su blocco (mediana X)
+// =========================
+Result run_tracking_1D_block(const std::vector<Detection>& seq) {
+    if (seq.empty()) return {0,0};
+
+    std::vector<float> xs;
+    xs.reserve(seq.size());
+    for (const auto& d : seq) {
+        if (!d.centroids.empty()) {
+            float x = d.centroids[0].first;
+            xs.push_back(x);
+        }
+    }
+    if (xs.size() < 5) return {0,0};
+
+    const float DEADZONE = 0.25f;
+    int in_count = 0, out_count = 0;
+
+    float xmin = *std::min_element(xs.begin(), xs.end());
+    float xmax = *std::max_element(xs.begin(), xs.end());
+
+    if (xmin < -DEADZONE && xmax > DEADZONE) {
+        // Cross detected
+        // Calcola media primi 20% e ultimi 20% del blocco
+        int k = std::max(1, (int)(xs.size()*0.2));
+        float avg_start = std::accumulate(xs.begin(), xs.begin()+k, 0.0f)/k;
+        float avg_end   = std::accumulate(xs.end()-k, xs.end(), 0.0f)/k;
+
+        if (avg_start > DEADZONE && avg_end < -DEADZONE) {
+            in_count++;
+            std::cout << "[TREND1 CROSS] pos->neg → IN "
+                      << "(avg_start="<<avg_start<<", avg_end="<<avg_end<<")\n";
+        } else if (avg_start < -DEADZONE && avg_end > DEADZONE) {
+            out_count++;
+            std::cout << "[TREND1 CROSS] neg->pos → OUT "
+                      << "(avg_start="<<avg_start<<", avg_end="<<avg_end<<")\n";
+        } else {
+            std::cout << "[TREND1 UNCLEAR] avg_start="<<avg_start
+                      << " avg_end="<<avg_end<<"\n";
+        }
+    } else {
+        std::cout << "[TREND1 NO CROSS] xmin="<<xmin<<" xmax="<<xmax<<"\n";
+    }
+
+    return {in_count, out_count};
+}
+// =========================
+// Distanza euclidea
+// =========================
+float dist2D(const std::pair<float,float>& a, const std::pair<float,float>& b) {
+    float dx = a.first - b.first;
+    float dy = a.second - b.second;
+    return std::sqrt(dx*dx + dy*dy);
+}
+
+// =========================
+// Hungarian semplificato
+// =========================
+std::vector<int> hungarian(const std::vector<std::vector<float>>& cost) {
+    int n = cost.size();
+    int m = cost[0].size();
+    std::vector<int> assignment(n, -1);
+
+    for (int i=0;i<n;i++) {
+        float best = 1e9;
+        int best_j = -1;
+        for (int j=0;j<m;j++) {
+            if (cost[i][j] < best) {
+                best = cost[i][j];
+                best_j = j;
+            }
+        }
+        assignment[i] = best_j;
+    }
+    return assignment;
+}
+
+// =========================
+// Tracking 2D (Kalman+Hungarian)
+// =========================
+Result run_tracking_2D(const std::vector<Detection>& seq) {
+    const int   MAX_AGE     = 5;
+    const float DIST_THRESH = 2.0f;
+    const int   COOLDOWN    = 25;
+    const int   MIN_STREAK  = 10;
+    const int   LINE_POS    = 0;
+
+    std::map<int, Track2D> tracks;
+    int next_id = 1;
+    int counts_in = 0, counts_out = 0;
+
+    for (const auto& det : seq) {
+        auto dets = det.centroids;
+
+        // Predict
+        std::map<int, std::pair<float,float>> predicted;
+        for (auto& kv : tracks) {
+            auto& t = kv.second;
+            t.x += t.vx;
+            t.y += t.vy;
+            predicted[t.id] = {t.x, t.y};
+        }
+
+        // Cost matrix
+        std::vector<int> tids;
+        for (auto& kv : tracks) tids.push_back(kv.first);
+        std::vector<std::vector<float>> cost(tids.size(), std::vector<float>(dets.size(), 1e6));
+
+        for (int i=0;i<tids.size();i++) {
+            for (int j=0;j<dets.size();j++) {
+                cost[i][j] = dist2D(predicted[tids[i]], dets[j]);
+            }
+        }
+
+        // Hungarian assignment
+        std::vector<int> assign;
+        if (!cost.empty() && !dets.empty()) {
+            assign = hungarian(cost);
+        }
+
+        std::set<int> assigned_dets;
+
+        // Update tracks
+        for (int i=0;i<tids.size();i++) {
+            int tid = tids[i];
+            auto& t = tracks[tid];
+            int j = (assign.empty() ? -1 : assign[i]);
+            if (j>=0 && j<dets.size() && cost[i][j] < DIST_THRESH) {
+                auto d = dets[j];
+                t.vx = d.first - t.x;
+                t.vy = d.second - t.y;
+                t.x = d.first;
+                t.y = d.second;
+                t.missed = 0;
+                t.age++;
+
+                if (t.age >= MIN_STREAK) {
+                    if (t.last_x <= LINE_POS && t.x > LINE_POS &&
+                        (det.frame - t.last_cross) > COOLDOWN) {
+                        counts_in++;
+                        t.last_cross = det.frame;
+                    } else if (t.last_x > LINE_POS && t.x <= LINE_POS &&
+                        (det.frame - t.last_cross) > COOLDOWN) {
+                        counts_out++;
+                        t.last_cross = det.frame;
+                    }
+                }
+                t.last_x = t.x;
+                assigned_dets.insert(j);
+            } else {
+                t.missed++;
+            }
+        }
+
+        // Cancella track persi
+        for (auto it = tracks.begin(); it!=tracks.end();) {
+            if (it->second.missed > MAX_AGE) {
+                it = tracks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Nuovi track
+        for (int j=0;j<dets.size();j++) {
+            if (!assigned_dets.count(j)) {
+                auto d = dets[j];
+                Track2D t{next_id, d.first, d.second, 0,0,0,0,d.first,-COOLDOWN};
+                tracks[next_id] = t;
+                next_id++;
+            }
+        }
+    }
+
+    return {counts_in, counts_out};
+}
+// =========================
+// Open3D → Point Cloud
+// =========================
+std::shared_ptr<open3d::geometry::PointCloud>
+generatePointCloud(ArducamTOFCamera& tof, ArducamFrameBuffer* frame, const Eigen::Matrix4d& transform) {
+    Arducam::FrameFormat format;
+    frame->getFormat(FrameType::DEPTH_FRAME, format);
+
+    float* depth = (float*)frame->getData(FrameType::DEPTH_FRAME);
+    float* conf  = (float*)frame->getData(FrameType::CONFIDENCE_FRAME);
+
+    std::vector<float> filtered(format.width * format.height);
+    for (int i = 0; i < format.width * format.height; ++i)
+        filtered[i] = (conf[i] >= CONFIDENCE_VALUE) ? depth[i] : 0.f;
+
+    open3d::geometry::Image depth_img;
+    depth_img.Prepare(format.width, format.height, 1, 4);
+    std::memcpy(depth_img.data_.data(), filtered.data(), filtered.size() * sizeof(float));
+
+    float fx, fy, cx, cy;
+    getControl(tof, Control::INTRINSIC_FX, fx, 100);
+    getControl(tof, Control::INTRINSIC_FY, fy, 100);
+    getControl(tof, Control::INTRINSIC_CX, cx, 100);
+    getControl(tof, Control::INTRINSIC_CY, cy, 100);
+
+    open3d::camera::PinholeCameraIntrinsic intr(
+        format.width, format.height, fx, fy, cx, cy);
+
+    auto cloud = open3d::geometry::PointCloud::CreateFromDepthImage(
+        depth_img, intr, Eigen::Matrix4d::Identity(), 1000.0, 2.5);
+
+    cloud->Transform(transform);
+
+    std::vector<size_t> keep;
+    keep.reserve(cloud->points_.size());
+    for (size_t i = 0; i < cloud->points_.size(); ++i)
+        if (cloud->points_[i][2] > -2000 && cloud->points_[i][2] < -20) keep.push_back(i);
+
+    return cloud->SelectByIndex(keep);
+}
+
+// =========================
+// Sampler 1024 punti
+// =========================
+std::vector<Eigen::Vector3f>
+samplePoints(const std::shared_ptr<open3d::geometry::PointCloud>& cloud, size_t N, uint32_t seed) {
+    std::vector<Eigen::Vector3f> out;
+    const auto& P = cloud->points_;
+    const size_t M = P.size();
+
+    if (M == 0) return out;
+    out.reserve(N);
+
+    std::mt19937 rng(seed);
+    if (M >= N) {
+        std::vector<size_t> idx(M);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::shuffle(idx.begin(), idx.end(), rng);
+        for (size_t i = 0; i < N; ++i) {
+            const auto& v = P[idx[i]];
+            out.emplace_back((float)v(0), (float)v(1), (float)v(2)); // METRI
+        }
+    } else {
+        std::uniform_int_distribution<size_t> uni(0, M - 1);
+        for (size_t i = 0; i < N; ++i) {
+            const auto& v = P[uni(rng)];
+            out.emplace_back((float)v(0), (float)v(1), (float)v(2)); // METRI
+        }
+    }
+    return out;
+}
+
+// =========================
+// ONNX Runner
+// =========================
+struct OnnxRunner {
+    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "tofnet"};
+    Ort::SessionOptions so;
+    std::unique_ptr<Ort::Session> session;
+    Ort::MemoryInfo mem =
+        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::vector<const char*> input_names{"pts"};
+    std::vector<const char*> output_names{"class_logits","reg_coords"};
+    float last_probs[3] = {0,0,0};
+
+    float input_unit_scale = 1.0f; // punti in METRI
+
+    explicit OnnxRunner(const std::string& model_path) {
+        so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        session = std::make_unique<Ort::Session>(env, model_path.c_str(), so);
+    }
+
+    int infer(const std::vector<Eigen::Vector3f>& pts_native_units, float reg_out[2][3]) {
+        if (pts_native_units.empty()) return 0;
+
+        const int64_t num_pts = static_cast<int64_t>(pts_native_units.size());
+        std::vector<int64_t> shape{1, num_pts, 3};
+
+        std::vector<float> input;
+        input.reserve(static_cast<size_t>(num_pts) * 3);
+        for (const auto& p : pts_native_units) {
+            input.push_back(p.x() * input_unit_scale);
+            input.push_back(p.y() * input_unit_scale);
+            input.push_back(p.z() * input_unit_scale);
+        }
+
+        auto input_tensor = Ort::Value::CreateTensor<float>(
+            mem, input.data(), input.size(), shape.data(), shape.size());
+
+        auto outputs = session->Run(
+            Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1,
+            output_names.data(), output_names.size());
+
+        float* cls = outputs[0].GetTensorMutableData<float>();
+        int n = static_cast<int>(std::max_element(cls, cls + 3) - cls);
+
+        float* rc = outputs[1].GetTensorMutableData<float>();
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 3; ++j)
+                reg_out[i][j] = rc[i * 3 + j];
+
+        // debug input bounds
+        static int dbg_ctr = 0;
+        if ((dbg_ctr++ % 30) == 0) {
+            float xmin=1e9f,xmax=-1e9f, ymin=1e9f,ymax=-1e9f, zmin=1e9f,zmax=-1e9f;
+            for (size_t i=0;i<input.size(); i+=3) {
+                xmin = std::min(xmin, input[i+0]);
+                xmax = std::max(xmax, input[i+0]);
+                ymin = std::min(ymin, input[i+1]);
+                ymax = std::max(ymax, input[i+1]);
+                zmin = std::min(zmin, input[i+2]);
+                zmax = std::max(zmax, input[i+2]);
+            }
+            //std::cout << "[NET IN] scale=" << input_unit_scale                      << " X:[" << xmin << "," << xmax << "]"                      << " Y:[" << ymin << "," << ymax << "]"                      << " Z:[" << zmin << "," << zmax << "]\n";
+        }
+
+        //std::cout << "[ONNX LOGITS] "                   << cls[0] << " " << cls[1] << " " << cls[2] << "\n";
+
+        // softmax
+        float m = std::max(cls[0], std::max(cls[1], cls[2]));
+        double e0 = std::exp(cls[0]-m), e1 = std::exp(cls[1]-m), e2 = std::exp(cls[2]-m);
+        double s = e0+e1+e2;
+        last_probs[0] = e0/s;
+        last_probs[1] = e1/s;
+        last_probs[2] = e2/s;
+
+        //std::cout << "[PROB] n0=" << last_probs[0]                   << " n1=" << last_probs[1]                   << " n2=" << last_probs[2] << "\n";
+
+        return n;
+    }
+};
+
+std::vector<Detection> validate_block(const std::vector<Detection>& raw) {
+    std::vector<Detection> clean;
+    for (auto &d : raw) {
+        if (d.n > 0) clean.push_back(d); // scarta frame vuoti
+        // volendo puoi filtrare centroidi noise, ecc.
+    }
+    return clean;
+}
+
+// =========================
+// Dispatcher
+// =========================
+void dispatcher_thread() {
+    std::vector<Detection> buffer;
+    bool in_block = false;
+    int nonzero_count = 0;
+    int zero_count = 0;
+    int block_start = 0;
+
+    while (!finished) {
+        std::unique_lock<std::mutex> lock(mtx_det);
+        cv_det.wait(lock, [] { return !detections.empty() || finished; });
+
+        if (finished && detections.empty()) break;
+
+        Detection d = detections.front();
+        detections.pop_front();
+        lock.unlock();
+
+        if (d.n > 0) {
+            nonzero_count++;
+            zero_count = 0;
+            if (!in_block && nonzero_count >= 5) {
+                in_block = true;
+                block_start = d.frame;
+                buffer.clear();
+            }
+            if (in_block) buffer.push_back(d);
+        } else {
+            zero_count++;
+            nonzero_count = 0;
+            if (in_block && zero_count >= 20) {
+                int block_end = d.frame;
+                bool has_n2 = 0;
+                int n2_count = 0;
+                for (auto &dd : buffer) if (dd.n == 2) n2_count++;
+                has_n2 = (n2_count >= 3);
+
+                if (has_n2) {
+                    std::lock_guard<std::mutex> lk(mtx2);
+                    queue_thread2.push_back(buffer);
+                    cv2.notify_one();
+                } else {
+                    std::lock_guard<std::mutex> lk(mtx1);
+                    queue_thread1.push_back(buffer);
+                    cv1.notify_one();
+                }
+
+                std::cout << "[BLOCK] frames " << block_start << " → " << block_end
+                          << " dispatched to " << (has_n2 ? "thread2" : "thread1") << "\n";
+
+                buffer.clear();
+                in_block = false;
+            }
+        }
+    }
+}
+
+// =========================
+// Calcola centro bbox
+// =========================
+std::pair<float,float> compute_bbox_center(const std::shared_ptr<open3d::geometry::PointCloud>& cloud) {
+    if (!cloud || cloud->points_.empty()) {
+        return {0.0f, 0.0f};
+    }
+    auto bbox = cloud->GetAxisAlignedBoundingBox();
+    auto c = bbox.GetCenter();
+    return {static_cast<float>(c.x()), static_cast<float>(c.y())};
+}
+
+// =========================
+// Tracking 1D su centro bbox
+// =========================
+Result run_tracking_bbox_1D(const std::vector<Detection>& seq) {
+    // Parametri da tarare sul campo
+    const float LINE_POS   = 0.0f;   // linea virtuale al centro porta
+    const int   MIN_STREAK = 3;      // conferma dopo 3 frame
+    const int   COOLDOWN   = 30;     // evita doppi conteggi per ~1s a 30 FPS
+
+    int counts_in = 0, counts_out = 0;
+
+    // Stato interno
+    bool prev_side_known = false;
+    int  prev_side = 0; // -1 = sinistra, +1 = destra
+    int  streak = 0;
+    int  last_cross_frame = -COOLDOWN;
+
+    for (const auto& det : seq) {
+        if (det.centroids.empty()) continue;
+
+        float x = det.centroids[0].first;
+
+        int side = (x > LINE_POS) ? +1 : -1;
+
+        if (prev_side_known && side != prev_side) {
+            streak++;
+            if (streak >= MIN_STREAK && (det.frame - last_cross_frame) > COOLDOWN) {
+                if (prev_side == -1 && side == +1) {
+                    counts_in++;
+                    std::cout << "[CROSS] neg->pos → IN (frame="<<det.frame<<")\n";
+                } else if (prev_side == +1 && side == -1) {
+                    counts_out++;
+                    std::cout << "[CROSS] pos->neg → OUT (frame="<<det.frame<<")\n";
+                }
+                last_cross_frame = det.frame;
+                streak = 0;
+            }
+        } else {
+            streak = 0;
+        }
+
+        prev_side_known = true;
+        prev_side = side;
+    }
+
+    return {counts_in, counts_out};
+}
+
+// =========================
+// Consumer thread1
+// =========================
+void thread1_func() {
+    while (!finished) {
+        std::unique_lock<std::mutex> lock(mtx1);
+        cv1.wait(lock, []{ return !queue_thread1.empty() || finished; });
+        if (finished && queue_thread1.empty()) break;
+        auto block = queue_thread1.front();
+        queue_thread1.pop_front();
+        lock.unlock();
+
+        Result r = run_tracking_bbox_1D(block);
+
+        std::cout << "[THREAD1] IN=" << r.in_count << " OUT=" << r.out_count << "\n";
+        std::cout << block.size() << " frames processed\n"; 
+        for (const auto& det : block) {
+            std::cout << "Frame " << det.frame << ": n=" << det.n <<  "centroids=";
+            for (const auto& c : det.centroids) {
+                std::cout << "(" << c.first << "," << c.second << ") ";
+            }
+            std::cout << "\n";}
+    }
+}
+
+
+void thread2_func() {
+    while (!finished) {
+        std::unique_lock<std::mutex> lock(mtx2);
+        cv2.wait(lock, []{ return !queue_thread2.empty() || finished; });
+        if (finished && queue_thread2.empty()) break;
+        auto block = queue_thread2.front();
+        queue_thread2.pop_front();
+        lock.unlock();
+
+        Result r = run_tracking_2D(block);
+        std::cout << "[THREAD2] IN=" << r.in_count << " OUT=" << r.out_count << "\n";
+        std::cout << block.size() << " frames processed\n"; 
+        for (const auto& det : block) {
+            std::cout << "Frame " << det.frame << ": n=" << det.n << " centroids=";
+            for (const auto& c : det.centroids) {
+                std::cout << "(" << c.first << "," << c.second << ") ";
+            }
+            std::cout << "\n";  }
+
+    }
+}
+
+
+
+
+// =========================
+// MAIN
+// =========================
+int main(int argc, char* argv[]) {
+    open3d::utility::SetVerbosityLevel(open3d::utility::VerbosityLevel::Error);
+
+    std::string onnx_path = "tofnet.onnx";
+    const char* cfg_path = nullptr;
+    for (int i=1;i<argc;i++) {
+        std::string a(argv[i]);
+        if (a.rfind("--onnx=",0)==0) onnx_path = a.substr(7);
+        else cfg_path = argv[i];
+    }
+
+    ArducamTOFCamera tof;
+    if (!initCamera(tof, cfg_path)) {
+        std::cerr << "Errore apertura camera\n";
+        return -1;
+    }
+
+    // Flip assi come nel dataset
+    Eigen::Matrix4d m = Eigen::Matrix4d::Identity();
+    m << 1, 0, 0, 0,
+         0,-1, 0, 0,
+         0, 0,-1, 0,
+         0, 0, 0, 1;
+
+    OnnxRunner runner(onnx_path);
+
+    int frame_idx = 0;
+    auto t_start = std::chrono::high_resolution_clock::now();
+    int fps_counter = 0;
+
+    // Stato blocco
+    bool in_block = false;
+    int zero_count = 0;
+    int nonzero_count = 0;
+    int block_start = -1;
+
+    // Contatori dentro blocco
+    int count_n1 = 0;
+    int count_n2 = 0;
+    std::vector<Detection> buffer;
+
+    // Avvio thread
+    std::thread t1(thread1_func);
+    std::thread t2(thread2_func);
+
+    while (true) {
+        auto* frame = acquireFrame(tof);
+        if (!frame) continue;
+        auto cloud = generatePointCloud(tof, frame, m);
+        tof.releaseFrame(frame);
+        if (!cloud || cloud->points_.empty()) continue;
+
+        auto pts_m = samplePoints(cloud, kNumPoints, (uint32_t)frame_idx);
+
+        float reg[2][3] = {{0}};
+        int n = runner.infer(pts_m, reg);
+
+        float max_prob = *std::max_element(runner.last_probs, runner.last_probs+3);
+        Detection d;
+        d.frame = frame_idx;
+        d.n = n;
+
+        if (n == 1) {
+            auto c = compute_bbox_center(cloud);
+            d.centroids.push_back(c);
+        }
+
+
+        else if (n == 2) {
+            // Due centroidi: puoi usare la regressione della rete
+            d.centroids.push_back({reg[0][0], reg[0][1]});
+            d.centroids.push_back({reg[1][0], reg[1][1]});
+        }
+
+        // Se n==0, centroids rimane vuoto
+
+        // ---- Gestione blocchi ----
+        if (n > 0 && max_prob >= PROB_THRESH) {
+            nonzero_count++;
+            zero_count = 0;
+
+            // Dentro blocco: accumula statistiche
+            if (n == 1) count_n1++;
+            if (n == 2) count_n2++;
+            Detection det;
+            det.frame = frame_idx;
+            det.n = n;
+
+            // Se la rete ha predetto dei centroidi validi
+            if (n >= 1) {
+                if (!(std::fabs(reg[0][0]) < 1e-6 && std::fabs(reg[0][1]) < 1e-6)) {
+                    det.centroids.push_back(std::make_pair(reg[0][0], reg[0][1]));
+                }
+            }
+            if (n == 2) {
+                if (!(std::fabs(reg[1][0]) < 1e-6 && std::fabs(reg[1][1]) < 1e-6)) {
+                    det.centroids.push_back(std::make_pair(reg[1][0], reg[1][1]));
+                }
+            }
+
+            // Se non abbiamo centroidi validi → fallback al centroide geometrico
+            if (det.centroids.empty() && n > 0) {
+                auto c = geometricCentroidM(cloud);
+                det.centroids.push_back(std::make_pair(static_cast<float>(c.x()),
+                                       static_cast<float>(c.y())));
+            }
+
+            buffer.push_back(det);
+
+            if (!in_block && nonzero_count > 5) {
+                in_block = true;
+                block_start = frame_idx - nonzero_count + 1;
+                count_n1 = 0;
+                count_n2 = 0;
+                buffer.clear();
+                
+                Detection det;
+                det.frame = frame_idx;
+                det.n = n;
+
+                // Se la rete ha predetto dei centroidi validi
+                if (n >= 1) {
+                    if (!(std::fabs(reg[0][0]) < 1e-6 && std::fabs(reg[0][1]) < 1e-6)) {
+                        det.centroids.push_back({reg[0][0], reg[0][1]});
+                    }
+                }
+                if (n == 2) {
+                    if (!(std::fabs(reg[1][0]) < 1e-6 && std::fabs(reg[1][1]) < 1e-6)) {
+                        det.centroids.push_back({reg[1][0], reg[1][1]});
+                    }
+                }
+
+                // Se non abbiamo centroidi validi → fallback al centroide geometrico
+                if (det.centroids.empty() && n > 0) {
+                    auto c = geometricCentroidM(cloud);
+                    det.centroids.push_back({c.x(), c.y()});
+                }
+
+                buffer.push_back(det);
+            }
+
+        } else {
+            zero_count++;
+            nonzero_count = 0;
+
+            if (in_block && zero_count > 30) {
+                int block_end = frame_idx - zero_count;
+                std::cout << "[BLOCCO] frames " << block_start << " → " << block_end << "\n";
+
+                auto clean_block = validate_block(buffer);
+
+                if (count_n2 >= 10) {
+                    std::lock_guard<std::mutex> lk(mtx2);
+                    queue_thread2.push_back(clean_block);
+                    cv2.notify_one();
+                } else if (count_n1 > 0 && count_n2 < 10) {
+                    std::lock_guard<std::mutex> lk(mtx1);
+                    queue_thread1.push_back(clean_block);
+                    cv1.notify_one();
+                } else {
+                    std::cout << "→ scartato\n";
+                }
+
+                in_block = false;
+                count_n1 = 0;
+                count_n2 = 0;
+                buffer.clear();
+            }
+        }
+
+        frame_idx++;
+
+        // FPS ogni 30 frame
+        fps_counter++;
+        if (fps_counter >= 30) {
+            auto t_now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(t_now - t_start).count();
+            double fps = fps_counter / elapsed;
+            //std::cout << "[FPS] " << fps << std::endl;
+            fps_counter = 0;
+            t_start = t_now;
+        }
+    }
+
+    finished = true;
+    cv1.notify_all();
+    cv2.notify_all();
+    t1.join();
+    t2.join();
+
+    tof.stop();
+    tof.close();
+    return 0;
+}
+
