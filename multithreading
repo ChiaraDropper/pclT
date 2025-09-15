@@ -620,50 +620,114 @@ std::pair<float,float> compute_bbox_center(const std::shared_ptr<open3d::geometr
 // =========================
 // Tracking 1D su centro bbox
 // =========================
+// ----------------------------
+// Kalman 1D per tracking su x
+// ----------------------------
+struct Kalman1D {
+    float x, v;       // stato: posizione e velocità
+    float P[2][2];    // matrice covarianza
+
+    Kalman1D() {
+        x = 0; v = 0;
+        P[0][0] = 1; P[0][1] = 0;
+        P[1][0] = 0; P[1][1] = 1;
+    }
+
+    void predict(float dt=1.0f) {
+        // modello: x = x + v*dt
+        x += v * dt;
+
+        // aumenta incertezza (Q)
+        P[0][0] += 0.01f;
+        P[1][1] += 0.01f;
+    }
+
+    void update(float z) {
+        // innovazione
+        float y = z - x;
+
+        // varianza innovazione (R=0.1)
+        float S = P[0][0] + 0.1f;
+
+        // guadagni di Kalman
+        float Kx = P[0][0] / S;
+        float Kv = P[1][0] / S;
+
+        // aggiorna stato
+        x += Kx * y;
+        v += Kv * y;
+
+        // aggiorna covarianza
+        P[0][0] *= (1 - Kx);
+        P[1][0] *= (1 - Kx);
+    }
+};
+
+// ----------------------------
+// Tracking con Kalman
+// ----------------------------
 Result run_tracking_bbox_1D(const std::vector<Detection>& seq) {
-    // Parametri da tarare sul campo
-    const float LINE_POS   = 0.0f;   // linea virtuale al centro porta
-    const int   MIN_STREAK = 3;      // conferma dopo 3 frame
-    const int   COOLDOWN   = 30;     // evita doppi conteggi per ~1s a 30 FPS
+    const float LINE_POS = 0.0f;  // linea virtuale
+    const float DEADZONE = 0.15f; // margine attorno allo zero
+    const int   KAVG     = 10;    // quanti frame mediati all’inizio/fine
 
     int counts_in = 0, counts_out = 0;
+    if (seq.empty()) return {0,0};
 
-    // Stato interno
-    bool prev_side_known = false;
-    int  prev_side = 0; // -1 = sinistra, +1 = destra
-    int  streak = 0;
-    int  last_cross_frame = -COOLDOWN;
+    Kalman1D kf;
+    std::vector<float> traj;
 
+    // --- Filtra tutti i frame ---
     for (const auto& det : seq) {
         if (det.centroids.empty()) continue;
 
-        float x = det.centroids[0].first;
+        float cx = det.centroids[0].first;
 
-        int side = (x > LINE_POS) ? +1 : -1;
+        kf.predict();
+        kf.update(cx);
 
-        if (prev_side_known && side != prev_side) {
-            streak++;
-            if (streak >= MIN_STREAK && (det.frame - last_cross_frame) > COOLDOWN) {
-                if (prev_side == -1 && side == +1) {
-                    counts_in++;
-                    std::cout << "[CROSS] neg->pos → IN (frame="<<det.frame<<")\n";
-                } else if (prev_side == +1 && side == -1) {
-                    counts_out++;
-                    std::cout << "[CROSS] pos->neg → OUT (frame="<<det.frame<<")\n";
-                }
-                last_cross_frame = det.frame;
-                streak = 0;
-            }
-        } else {
-            streak = 0;
+        traj.push_back(kf.x);
+    }
+
+    if (traj.size() < 5) return {0,0}; // troppo pochi dati
+
+    // --- Media primi e ultimi KAVG ---
+    // --- Start robusto con majority voting sui centroidi grezzi ---
+    int k_start = std::min(5, (int)seq.size()); // primi 5 frame del blocco
+    int pos_count = 0, neg_count = 0;
+    for (int i = 0; i < k_start; i++) {
+        if (!seq[i].centroids.empty()) {
+            float x0 = seq[i].centroids[0].first;
+            if (x0 > LINE_POS) pos_count++;
+            else neg_count++;
         }
+    }
+    float avg_start = (pos_count > neg_count) ? (LINE_POS + DEADZONE + 0.1f)
+                                              : (LINE_POS - DEADZONE - 0.1f);
 
-        prev_side_known = true;
-        prev_side = side;
+    // --- End resta mediato dal Kalman ---
+    int k_end = std::min(KAVG, (int)traj.size()/2);
+    float avg_end = std::accumulate(traj.end()-k_end, traj.end(), 0.0f) / k_end;
+
+    // --- Decidi direzione ---
+    if (avg_start < LINE_POS - DEADZONE && avg_end > LINE_POS + DEADZONE) {
+        counts_out++;
+        std::cout << "[KALMAN CROSS] neg->pos → out"
+                  << " (start="<<avg_start<<", end="<<avg_end<<")\n";
+    }
+    else if (avg_start > LINE_POS + DEADZONE && avg_end < LINE_POS - DEADZONE) {
+        counts_in++;
+        std::cout << "[KALMAN CROSS] pos->neg → in"
+                  << " (start="<<avg_start<<", end="<<avg_end<<")\n";
+    }
+    else {
+        std::cout << "[KALMAN NO CROSS] start="<<avg_start
+                  << " end="<<avg_end<<"\n";
     }
 
     return {counts_in, counts_out};
 }
+
 
 // =========================
 // Consumer thread1
@@ -828,7 +892,7 @@ int main(int argc, char* argv[]) {
 
             buffer.push_back(det);
 
-            if (!in_block && nonzero_count > 5) {
+            if (!in_block && nonzero_count > 3) {
                 in_block = true;
                 block_start = frame_idx - nonzero_count + 1;
                 count_n1 = 0;
@@ -913,4 +977,3 @@ int main(int argc, char* argv[]) {
     tof.close();
     return 0;
 }
-
